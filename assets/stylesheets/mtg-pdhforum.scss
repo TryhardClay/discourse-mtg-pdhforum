@@ -1,0 +1,75 @@
+// ============================================================
+// PDH Forum MTG Plugin Styles
+// Mana font + card tooltip
+// ============================================================
+
+// Import Mana font from CDN
+@import url("https://cdn.jsdelivr.net/npm/mana-font@1.18.0/css/mana.min.css");
+
+// ── Mana Symbol Rendering ──────────────────────────────────
+
+.mana-symbol {
+  display: inline-block;
+  vertical-align: middle;
+  line-height: 1;
+  margin: 0 1px;
+
+  i.ms {
+    font-size: 1.1em;
+    vertical-align: middle;
+  }
+}
+
+// ── Card Tooltip ───────────────────────────────────────────
+
+.mtg-card-link {
+  color: var(--tertiary);
+  text-decoration: none;
+  border-bottom: 1px dashed var(--tertiary);
+  cursor: pointer;
+  position: relative;
+
+  &:hover {
+    color: var(--tertiary-high);
+
+    .mtg-card-tooltip {
+      display: block;
+    }
+  }
+}
+
+.mtg-card-tooltip {
+  display: none;
+  position: absolute;
+  z-index: 9999;
+  bottom: calc(100% + 8px);
+  left: 50%;
+  transform: translateX(-50%);
+  pointer-events: none;
+
+  img {
+    width: 223px;
+    height: 311px;
+    border-radius: 12px;
+    box-shadow: 0 8px 24px rgba(0, 0, 0, 0.6);
+    display: block;
+  }
+
+  // Arrow pointing down
+  &::after {
+    content: "";
+    position: absolute;
+    top: 100%;
+    left: 50%;
+    transform: translateX(-50%);
+    border: 6px solid transparent;
+    border-top-color: rgba(0, 0, 0, 0.6);
+  }
+}
+
+// Keep tooltip on screen near left/right edges
+.mtg-card-link:first-child .mtg-card-tooltip,
+.mtg-card-link:nth-child(2) .mtg-card-tooltip {
+  left: 0;
+  transform: none;
+}
