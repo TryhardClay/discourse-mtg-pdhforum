@@ -125,7 +125,7 @@ def create_lfg_topic(requester_username, format_key):
 **Format:** {label}
 **Platform:** Convoke (webcam)
 
-[poll type=regular results=always public=true close=1h]
+[poll type=regular results=on_vote public=true close=1h]
 * Join me
 [/poll]"""
 
