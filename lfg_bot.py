@@ -125,7 +125,7 @@ def create_lfg_topic(requester_username, format_key):
 **Format:** {label}
 **Platform:** Convoke (webcam)
 
-[poll type=regular results=on_vote public=true close=1h]
+[poll type=regular results=always public=true close=1h]
 * Join me
 [/poll]"""
 
@@ -258,10 +258,20 @@ def check_dm_channels():
             tracking = channel.get("meta", {}).get("message_bus_last_ids", {})
             unread = tracking.get("new_messages", 0)
 
+            messages = get_channel_messages(channel_id)
+
+            # First time seeing this channel — mark all existing messages as seen
+            # so we only respond to messages sent after the bot started
+            if channel_id not in processed_message_ids:
+                if messages:
+                    processed_message_ids[channel_id] = max(m.get("id", 0) for m in messages)
+                else:
+                    processed_message_ids[channel_id] = 0
+                continue
+
             if unread == 0:
                 continue
 
-            messages = get_channel_messages(channel_id)
             last_seen = processed_message_ids.get(channel_id, 0)
 
             for msg in messages:
