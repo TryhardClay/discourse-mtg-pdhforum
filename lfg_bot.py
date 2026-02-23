@@ -93,7 +93,7 @@ def get_channel_messages(channel_id):
 def send_chat_message(channel_id, message):
     """Send a message to a chat channel."""
     data = {"message": message}
-    return discourse_post(f"/chat/api/channels/{channel_id}/messages", data)
+    return discourse_post(f"/chat/{channel_id}", data)
 
 def get_or_create_dm_channel(username):
     """Get or create a DM channel with a specific user."""
