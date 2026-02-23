@@ -1,16 +1,19 @@
 #!/usr/bin/env python3
 """
-PDH Forum LFG Bot
-Monitors for LFG requests via PM to @PDHMatchmaker,
-creates Looking for Game topics, monitors polls,
-and creates Convoke game rooms when matches are found.
+PDH Forum LFG Bot v2
+Monitors chat DMs to @PDHMatchmaker for LFG triggers,
+creates Looking for Game topics in the appropriate category,
+monitors polls, and delivers Convoke game links via chat DM.
+
+Triggers:
+  casual -> Casual PDH LFG (4 players)
+  comp   -> Competitive PDH LFG (4 players)
+  1v1    -> 1v1 PDH LFG (2 players)
 """
 
 import requests
 import time
-import json
 import logging
-from datetime import datetime, timezone
 
 # ============================================================
 # Configuration
@@ -23,9 +26,16 @@ DISCOURSE_BOT_USERNAME = "PDHMatchmaker"
 CONVOKE_API_URL = "https://api.convoke.games/api/game/create-game"
 CONVOKE_API_KEY = "convk_6536e0adb4c407d49bfa7d4ee4d44c489dc147a6"
 
-LFG_CATEGORY_ID = 35
-LFG_TAG = "lfg"
 POLL_INTERVAL_SECONDS = 30
+
+# LFG category config: trigger -> (category_id, seat_count, convoke_format, label)
+LFG_FORMATS = {
+    "casual": (36, 4, "commander", "Casual PDH"),
+    "comp":   (37, 4, "commander", "Competitive PDH"),
+    "1v1":    (35, 2, "standard",  "1v1 PDH"),
+}
+
+LFG_TAG = "lfg"
 
 # ============================================================
 # Logging
@@ -66,46 +76,53 @@ def discourse_delete(path):
     r.raise_for_status()
     return r
 
-def get_unread_pms():
-    """Fetch unread private messages sent to the bot."""
-    data = discourse_get("/topics/private-messages/PDHMatchmaker.json")
-    topics = data.get("topic_list", {}).get("topics", [])
-    return [t for t in topics if t.get("unread_posts", 0) > 0 or t.get("highest_post_number", 0) == 1]
+# ============================================================
+# Chat API Helpers
+# ============================================================
 
-def get_topic_posts(topic_id):
-    """Fetch all posts in a topic."""
-    data = discourse_get(f"/t/{topic_id}.json")
-    return data
+def get_dm_channels():
+    """Fetch all DM channels for the bot account."""
+    data = discourse_get("/chat/api/me/channels")
+    return data.get("direct_message_channels", [])
 
-def send_pm(username, subject, message):
-    """Send a private message to a user."""
-    data = {
-        "title": subject,
-        "raw": message,
-        "target_recipients": username,
-        "archetype": "private_message"
-    }
-    return discourse_post("/posts.json", data)
+def get_channel_messages(channel_id):
+    """Fetch messages from a chat DM channel."""
+    data = discourse_get(f"/chat/api/channels/{channel_id}/messages")
+    return data.get("messages", [])
 
-def reply_to_pm(topic_id, message):
-    """Reply to an existing PM thread."""
-    data = {
-        "topic_id": topic_id,
-        "raw": message
-    }
-    return discourse_post("/posts.json", data)
+def send_chat_message(channel_id, message):
+    """Send a message to a chat channel."""
+    data = {"message": message}
+    return discourse_post(f"/chat/api/channels/{channel_id}/messages", data)
 
-def create_lfg_topic(requester_username):
-    """Create a Looking for Game topic on behalf of the requesting user."""
-    title = f"Looking for a 1v1 PDH Game — {requester_username}"
-    body = f"""Looking for a 1v1 PDH game on Convoke! Vote below to join @{requester_username}.
+def get_or_create_dm_channel(username):
+    """Get or create a DM channel with a specific user."""
+    data = {"target_usernames": [username]}
+    result = discourse_post("/chat/api/direct-messages", data)
+    return result.get("channel", {}).get("id")
 
-> ⏱ This post expires in 1 hour. If a second player joins before then,
-> a Convoke game room will be created automatically and both players
-> will receive a join link via private message. If no one joins, this
-> post will be removed automatically.
+# ============================================================
+# Topic Helpers
+# ============================================================
 
-**Format:** 1v1 PDH
+def create_lfg_topic(requester_username, format_key):
+    """Create a Looking for Game topic for the given format."""
+    category_id, seat_count, _, label = LFG_FORMATS[format_key]
+
+    title = f"Looking for a {label} Game — {requester_username}"
+
+    if seat_count == 2:
+        poll_line = "Vote below — first player to join gets the spot!"
+        seat_text = "Once a second player joins the poll, both players will receive a Convoke link via DM."
+    else:
+        poll_line = "Vote below — 3 spots available!"
+        seat_text = f"Once all {seat_count} spots are filled, everyone will receive a Convoke link via DM."
+
+    body = f"""@{requester_username} is looking for a {label} game on Convoke! {poll_line}
+
+> ⏱ This post expires in 1 hour. {seat_text} If the poll doesn't fill in time, it will be removed automatically and all participants will be notified via DM. No Discord required.
+
+**Format:** {label}
 **Platform:** Convoke (webcam)
 
 [poll type=regular results=always public=true close=1h]
@@ -115,49 +132,45 @@ def create_lfg_topic(requester_username):
     data = {
         "title": title,
         "raw": body,
-        "category": LFG_CATEGORY_ID,
+        "category": category_id,
         "tags": [LFG_TAG]
     }
     return discourse_post("/posts.json", data)
 
-def get_lfg_topics():
-    """Fetch all open topics in the LFG category."""
-    data = discourse_get(f"/c/{LFG_CATEGORY_ID}.json")
+def get_lfg_topics(category_id):
+    """Fetch all open topics in an LFG category."""
+    data = discourse_get(f"/c/{category_id}.json")
     return data.get("topic_list", {}).get("topics", [])
 
 def get_poll_data(topic_id):
-    """Fetch poll data from a topic."""
+    """Fetch poll voters and status from a topic."""
     data = discourse_get(f"/t/{topic_id}.json")
     posts = data.get("post_stream", {}).get("posts", [])
     if not posts:
-        return None, None, data
-
+        return None, None, None, data
     first_post = posts[0]
+    post_id = first_post.get("id")
     polls = first_post.get("polls", [])
     if not polls:
-        return None, None, data
-
+        return None, None, None, data
     poll = polls[0]
     voters = poll.get("voters", 0)
     is_closed = poll.get("status") == "closed"
-    voter_data = poll.get("options", [])
-
-    return voters, is_closed, data
+    return voters, is_closed, post_id, data
 
 def get_poll_voters(topic_id, post_id):
-    """Get usernames of users who voted in the poll."""
+    """Get usernames of all poll voters."""
     try:
         data = discourse_get(
-            f"/polls/voters.json",
+            "/polls/voters.json",
             params={
                 "topic_id": topic_id,
                 "post_id": post_id,
                 "poll_name": "poll",
-                "option_id": "0"  # First option
+                "option_id": "0"
             }
         )
         voters = data.get("voters", {})
-        # voters is a dict keyed by option_id
         all_voters = []
         for option_voters in voters.values():
             all_voters.extend([v.get("username") for v in option_voters if v.get("username")])
@@ -170,25 +183,19 @@ def delete_topic(topic_id):
     """Delete a topic."""
     return discourse_delete(f"/t/{topic_id}.json")
 
-def close_topic(topic_id):
-    """Close a topic."""
-    data = {"status": "closed", "enabled": "true"}
-    r = requests.put(f"{DISCOURSE_URL}/t/{topic_id}/status.json", headers=HEADERS, json=data)
-    r.raise_for_status()
-    return r.json()
-
 # ============================================================
 # Convoke API
 # ============================================================
 
-def create_convoke_room(requester_username):
+def create_convoke_room(requester_username, format_key):
     """Create a Convoke game room and return the join URL."""
+    _, seat_count, convoke_format, label = LFG_FORMATS[format_key]
     payload = {
         "apiKey": CONVOKE_API_KEY,
-        "name": f"PDH Forum 1v1 — {requester_username}",
+        "name": f"PDH Forum {label} — {requester_username}",
         "isPublic": False,
-        "seatLimit": 2,
-        "format": "standard"
+        "seatLimit": seat_count,
+        "format": convoke_format
     }
     r = requests.post(CONVOKE_API_URL, json=payload)
     r.raise_for_status()
@@ -196,132 +203,142 @@ def create_convoke_room(requester_username):
     return data.get("data", {}).get("url")
 
 # ============================================================
-# Bot State (in-memory)
+# Bot State
 # ============================================================
 
-# Tracks PM topic IDs we've already processed to avoid double-acting
-processed_pm_ids = set()
+# channel_id -> last processed message id
+processed_message_ids = {}
 
-# Maps LFG topic_id -> requester_username
+# topic_id -> {requester, format_key, channel_id}
 active_lfg_topics = {}
 
 # ============================================================
 # Core Logic
 # ============================================================
 
-def handle_lfg_request(pm_topic_id, requester_username):
-    """Process an incoming LFG PM request."""
-    log.info(f"LFG request from {requester_username} (PM topic {pm_topic_id})")
+def handle_lfg_request(channel_id, requester_username, format_key):
+    """Create an LFG topic and confirm via chat DM."""
+    _, _, _, label = LFG_FORMATS[format_key]
+    log.info(f"LFG request from {requester_username} for {label} (channel {channel_id})")
 
     try:
-        result = create_lfg_topic(requester_username)
-        lfg_topic_id = result.get("topic_id")
+        result = create_lfg_topic(requester_username, format_key)
+        topic_id = result.get("topic_id")
 
-        if not lfg_topic_id:
+        if not topic_id:
             log.error(f"Failed to create LFG topic for {requester_username}")
-            reply_to_pm(pm_topic_id, "Sorry, I couldn't create your LFG post right now. Please try again in a moment.")
+            send_chat_message(channel_id, "Sorry, I couldn't create your LFG post right now. Please try again in a moment.")
             return
 
-        active_lfg_topics[lfg_topic_id] = requester_username
-        topic_url = f"{DISCOURSE_URL}/t/{lfg_topic_id}"
+        active_lfg_topics[topic_id] = {
+            "requester": requester_username,
+            "format_key": format_key,
+            "channel_id": channel_id
+        }
 
-        reply_to_pm(
-            pm_topic_id,
+        topic_url = f"{DISCOURSE_URL}/t/{topic_id}"
+        send_chat_message(
+            channel_id,
             f"Your LFG post is live! ➡️ {topic_url}\n\n"
-            f"I'll notify you via PM as soon as an opponent joins. "
-            f"If no one joins within 1 hour, the post will be removed automatically."
+            f"I'll DM you as soon as the game fills. "
+            f"If no one joins within 1 hour the post will be removed and I'll let you know."
         )
-        log.info(f"Created LFG topic {lfg_topic_id} for {requester_username}")
+        log.info(f"Created LFG topic {topic_id} for {requester_username} ({label})")
 
     except Exception as e:
-        log.error(f"Error handling LFG request from {requester_username}: {e}")
-        reply_to_pm(pm_topic_id, "Sorry, something went wrong creating your LFG post. Please try again.")
+        log.error(f"Error creating LFG topic for {requester_username}: {e}")
+        send_chat_message(channel_id, "Sorry, something went wrong. Please try again.")
 
-def check_pm_inbox():
-    """Check for new LFG requests via PM."""
+def check_dm_channels():
+    """Check all DM channels for new LFG trigger messages."""
     try:
-        pms = get_unread_pms()
-        for pm in pms:
-            pm_topic_id = pm.get("id")
-            if pm_topic_id in processed_pm_ids:
+        channels = get_dm_channels()
+        for channel in channels:
+            channel_id = channel.get("id")
+            tracking = channel.get("meta", {}).get("message_bus_last_ids", {})
+            unread = tracking.get("new_messages", 0)
+
+            if unread == 0:
                 continue
 
-            # Fetch the actual PM content
-            topic_data = get_topic_posts(pm_topic_id)
-            posts = topic_data.get("post_stream", {}).get("posts", [])
+            messages = get_channel_messages(channel_id)
+            last_seen = processed_message_ids.get(channel_id, 0)
 
-            if not posts:
-                continue
+            for msg in messages:
+                msg_id = msg.get("id", 0)
+                if msg_id <= last_seen:
+                    continue
 
-            # Get the first post (the original message)
-            first_post = posts[0]
-            raw = first_post.get("raw", "").strip().lower()
-            requester_username = first_post.get("username")
+                sender = msg.get("user", {}).get("username")
+                if sender == DISCOURSE_BOT_USERNAME:
+                    processed_message_ids[channel_id] = max(last_seen, msg_id)
+                    continue
 
-            # Ignore messages from the bot itself
-            if requester_username == DISCOURSE_BOT_USERNAME:
-                processed_pm_ids.add(pm_topic_id)
-                continue
+                text = msg.get("message", "").strip().lower()
+                processed_message_ids[channel_id] = max(last_seen, msg_id)
 
-            if "lfg" in raw:
-                processed_pm_ids.add(pm_topic_id)
-                handle_lfg_request(pm_topic_id, requester_username)
-            else:
-                # Not an LFG trigger — send help message
-                processed_pm_ids.add(pm_topic_id)
-                reply_to_pm(
-                    pm_topic_id,
-                    "Hi! To find a 1v1 PDH game, send me a PM with just the word **lfg** and I'll create a match post for you automatically."
-                )
+                if text in LFG_FORMATS:
+                    handle_lfg_request(channel_id, sender, text)
+                else:
+                    send_chat_message(
+                        channel_id,
+                        "Hi! I can help you find a PDH game on Convoke.\n\n"
+                        "Send me one of these:\n"
+                        "• **casual** — find a Casual PDH game (4 players)\n"
+                        "• **comp** — find a Competitive PDH game (4 players)\n"
+                        "• **1v1** — find a 1v1 PDH match (2 players)"
+                    )
 
     except Exception as e:
-        log.error(f"Error checking PM inbox: {e}")
+        log.error(f"Error checking DM channels: {e}")
 
 def check_active_lfg_topics():
-    """Check all active LFG topics for fulfilled polls or expired polls."""
+    """Check all active LFG topics for fulfilled or expired polls."""
     stale_topics = []
 
-    for topic_id, requester_username in list(active_lfg_topics.items()):
+    for topic_id, info in list(active_lfg_topics.items()):
+        requester = info["requester"]
+        format_key = info["format_key"]
+        channel_id = info["channel_id"]
+        _, seat_count, _, label = LFG_FORMATS[format_key]
+
         try:
-            voters, is_closed, topic_data = get_poll_data(topic_id)
+            voters, is_closed, post_id, topic_data = get_poll_data(topic_id)
 
             if voters is None:
-                # Topic may have been deleted or poll removed
                 stale_topics.append(topic_id)
                 continue
 
-            if voters >= 2:
-                # Poll fulfilled — get voter usernames
-                posts = topic_data.get("post_stream", {}).get("posts", [])
-                post_id = posts[0].get("id") if posts else None
+            if voters >= seat_count:
+                # Poll fulfilled
                 voter_usernames = get_poll_voters(topic_id, post_id) if post_id else []
+                log.info(f"Match found! Topic {topic_id} ({label}): {voter_usernames}")
 
-                # Find the joiner (not the requester)
-                joiner = next((u for u in voter_usernames if u != requester_username), None)
-
-                log.info(f"Match found! Topic {topic_id}: {requester_username} vs {joiner}")
-
-                # Create Convoke room
                 try:
-                    room_url = create_convoke_room(requester_username)
+                    room_url = create_convoke_room(requester, format_key)
                     if room_url:
                         msg = (
-                            f"✅ **Match found!** Your 1v1 PDH game is ready.\n\n"
-                            f"**Join your game here:** {room_url}\n\n"
-                            f"Good luck and have fun!"
+                            f"✅ **Game found!** Your {label} game is ready.\n\n"
+                            f"**Join here:** {room_url}\n\n"
+                            f"Good luck and have fun! No Discord required."
                         )
-                        send_pm(requester_username, "Your 1v1 PDH game is ready!", msg)
-                        if joiner:
-                            send_pm(joiner, "Your 1v1 PDH game is ready!", msg)
-                        log.info(f"Convoke room created and PMs sent: {room_url}")
+                        # DM all voters
+                        for username in voter_usernames:
+                            try:
+                                dm_channel = get_or_create_dm_channel(username)
+                                if dm_channel:
+                                    send_chat_message(dm_channel, msg)
+                            except Exception as e:
+                                log.error(f"Failed to DM {username}: {e}")
+                        log.info(f"Convoke room created and DMs sent: {room_url}")
                     else:
                         log.error("Convoke returned no URL")
-                        send_pm(requester_username, "Match found but room creation failed", "A match was found but the Convoke room couldn't be created. Please coordinate directly.")
+                        send_chat_message(channel_id, "A match was found but the Convoke room couldn't be created. Please coordinate directly.")
+
                 except Exception as e:
                     log.error(f"Convoke API error: {e}")
-                    send_pm(requester_username, "Match found but room creation failed", "A match was found but the Convoke room couldn't be created. Please coordinate directly.")
+                    send_chat_message(channel_id, "A match was found but the Convoke room couldn't be created. Please coordinate directly.")
 
-                # Delete the LFG topic
                 try:
                     delete_topic(topic_id)
                     log.info(f"Deleted fulfilled LFG topic {topic_id}")
@@ -330,14 +347,25 @@ def check_active_lfg_topics():
 
                 stale_topics.append(topic_id)
 
-            elif is_closed and voters < 2:
-                # Poll expired with no match
-                log.info(f"LFG topic {topic_id} expired with no match for {requester_username}")
-                send_pm(
-                    requester_username,
-                    "Your LFG post expired",
-                    "Unfortunately no opponent joined your LFG post before it expired. Feel free to try again anytime!"
-                )
+            elif is_closed and voters < seat_count:
+                # Poll expired unfulfilled — notify all who did vote
+                log.info(f"LFG topic {topic_id} expired with {voters}/{seat_count} players")
+
+                voter_usernames = get_poll_voters(topic_id, post_id) if post_id else []
+                notify_users = voter_usernames if voter_usernames else [requester]
+
+                for username in notify_users:
+                    try:
+                        dm_channel = get_or_create_dm_channel(username)
+                        if dm_channel:
+                            send_chat_message(
+                                dm_channel,
+                                f"Unfortunately your {label} LFG post expired before it could fill "
+                                f"({voters}/{seat_count} players joined). Feel free to try again anytime!"
+                            )
+                    except Exception as e:
+                        log.error(f"Failed to notify {username}: {e}")
+
                 try:
                     delete_topic(topic_id)
                     log.info(f"Deleted expired LFG topic {topic_id}")
@@ -349,37 +377,40 @@ def check_active_lfg_topics():
         except Exception as e:
             log.error(f"Error checking LFG topic {topic_id}: {e}")
 
-    # Clean up stale entries
     for topic_id in stale_topics:
         active_lfg_topics.pop(topic_id, None)
 
 def restore_active_topics():
-    """On startup, reload any existing LFG topics into memory."""
+    """On startup, reload existing LFG topics into memory."""
     log.info("Restoring active LFG topics from forum...")
-    try:
-        topics = get_lfg_topics()
-        for topic in topics:
-            topic_id = topic.get("id")
-            title = topic.get("title", "")
-            # Parse requester username from title format "Looking for a 1v1 PDH Game — username"
-            if "—" in title:
-                requester_username = title.split("—")[-1].strip()
-                active_lfg_topics[topic_id] = requester_username
-                log.info(f"  Restored topic {topic_id} for {requester_username}")
-    except Exception as e:
-        log.error(f"Error restoring active topics: {e}")
+    for format_key, (category_id, _, _, label) in LFG_FORMATS.items():
+        try:
+            topics = get_lfg_topics(category_id)
+            for topic in topics:
+                topic_id = topic.get("id")
+                title = topic.get("title", "")
+                if "—" in title:
+                    requester = title.split("—")[-1].strip()
+                    active_lfg_topics[topic_id] = {
+                        "requester": requester,
+                        "format_key": format_key,
+                        "channel_id": None  # channel unknown after restart
+                    }
+                    log.info(f"  Restored {label} topic {topic_id} for {requester}")
+        except Exception as e:
+            log.error(f"Error restoring {label} topics: {e}")
 
 # ============================================================
 # Main Loop
 # ============================================================
 
 def main():
-    log.info("PDH Forum LFG Bot starting...")
+    log.info("PDH Forum LFG Bot v2 starting...")
     restore_active_topics()
     log.info(f"Monitoring every {POLL_INTERVAL_SECONDS} seconds. Active topics: {len(active_lfg_topics)}")
 
     while True:
-        check_pm_inbox()
+        check_dm_channels()
         check_active_lfg_topics()
         time.sleep(POLL_INTERVAL_SECONDS)
 
