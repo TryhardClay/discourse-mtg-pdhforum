@@ -7,6 +7,20 @@ Author: TryhardClay
 ===============================================================
 VERSION HISTORY
 ===============================================================
+v2.2.0 (2026-02-24)
+  - Replaced individual DM loop with single group DM channel
+    containing all matched players plus the bot account
+  - Match notification now runs unconditionally regardless of
+    Convoke outcome — Convoke result affects message content only
+  - Baseline match message uses Convoke lobby link as fallback:
+    https://convoke.games/en/lobby
+  - Convoke API room creation stubbed out and disabled — will be
+    re-enabled in a future session once group DM flow is confirmed
+  - Expiry notifications also use group DM when multiple players
+    are involved, individual DM when only the requester is present
+  - create_group_dm() helper added to replace get_or_create_dm_channel()
+    in match and expiry notification flows
+
 v2.1.0 (2026-02-24)
   - Redesigned check_dm_channels for scalability:
       * Channels with unread_count == 0 are skipped entirely
@@ -40,8 +54,7 @@ v2.0.0 (2026-02-24)
   - On bot restart, active topics are restored with a fresh
     1-hour expiry window
   - Cycle time reduced from 30s to 5s (max 3 active topics)
-  - All voters plus requester receive Convoke link and expiry
-    notifications via DM
+  - All voters plus requester receive notifications via DM
 
 ===============================================================
 TRIGGERS (send via DM to @PDHMatchmaker)
@@ -63,8 +76,11 @@ DISCOURSE_URL = "https://pdhforum.com"
 DISCOURSE_API_KEY = "6421b230423d9fcfc043e4f1537441baa05e079f0a7442494c7ecc929360f3c3"
 DISCOURSE_BOT_USERNAME = "PDHMatchmaker"
 
-CONVOKE_API_URL = "https://api.convoke.games/api/game/create-game"
-CONVOKE_API_KEY = "convk_6536e0adb4c407d49bfa7d4ee4d44c489dc147a6"
+# Convoke API — stubbed out pending group DM confirmation
+# CONVOKE_API_URL = "https://api.convoke.games/api/game/create-game"
+# CONVOKE_API_KEY = "convk_6536e0adb4c407d49bfa7d4ee4d44c489dc147a6"
+
+CONVOKE_LOBBY_URL = "https://convoke.games/en/lobby"
 
 POLL_INTERVAL_SECONDS = 5
 LFG_EXPIRY_SECONDS = 3600  # 1 hour
@@ -150,10 +166,30 @@ def send_chat_message(channel_id, message):
     return discourse_post(f"/chat/{channel_id}", data)
 
 def get_or_create_dm_channel(username):
-    """Get or create a DM channel with a specific user."""
+    """Get or create a 1:1 DM channel with a specific user."""
     data = {"target_usernames": [username]}
     result = discourse_post("/chat/api/direct-messages", data)
     return result.get("channel", {}).get("id")
+
+def create_group_dm(usernames):
+    """
+    Create a group DM channel containing all provided usernames.
+    The bot account is included automatically as the API actor.
+    Returns the channel ID or None on failure.
+    usernames should be a list of Discourse username strings.
+    """
+    try:
+        data = {"target_usernames": usernames}
+        result = discourse_post("/chat/api/direct-messages", data)
+        channel_id = result.get("channel", {}).get("id")
+        if channel_id:
+            log.info(f"Created group DM channel {channel_id} for: {usernames}")
+        else:
+            log.error(f"Group DM creation returned no channel ID for: {usernames}")
+        return channel_id
+    except Exception as e:
+        log.error(f"Failed to create group DM for {usernames}: {e}")
+        return None
 
 # ============================================================
 # Topic Helpers
@@ -242,25 +278,6 @@ def delete_topic(topic_id):
     return discourse_delete(f"/t/{topic_id}.json")
 
 # ============================================================
-# Convoke API
-# ============================================================
-
-def create_convoke_room(requester_username, format_key):
-    """Create a Convoke game room and return the join URL."""
-    _, seat_count, _, convoke_format, label = LFG_FORMATS[format_key]
-    payload = {
-        "apiKey": CONVOKE_API_KEY,
-        "name": f"PDH Forum {label} — {requester_username}",
-        "isPublic": False,
-        "seatLimit": seat_count,
-        "format": convoke_format
-    }
-    r = requests.post(CONVOKE_API_URL, json=payload)
-    r.raise_for_status()
-    data = r.json()
-    return data.get("data", {}).get("url")
-
-# ============================================================
 # Bot State
 # ============================================================
 
@@ -282,6 +299,56 @@ def get_active_topic_for_format(format_key):
         if info["format_key"] == format_key:
             return topic_id
     return None
+
+def notify_match(all_players, label):
+    """
+    Send a match notification to all players via a single group DM.
+    Creates a group DM channel containing all players.
+    Convoke API room creation is stubbed — lobby link used as baseline.
+    """
+    msg = (
+        f"✅ **Game found!** Your {label} game is ready.\n\n"
+        f"Head to the Convoke lobby to set up your game:\n"
+        f"**{CONVOKE_LOBBY_URL}**\n\n"
+        f"Your fellow players: {', '.join(f'@{u}' for u in all_players)}\n\n"
+        f"Good luck and have fun! No Discord required."
+    )
+
+    group_channel = create_group_dm(all_players)
+    if group_channel:
+        send_chat_message(group_channel, msg)
+        log.info(f"Match notification sent to group DM {group_channel}: {all_players}")
+    else:
+        log.error(f"Failed to create group DM for match — players were: {all_players}")
+
+def notify_expiry(all_players, label, voters, poll_threshold):
+    """
+    Send an expiry notification to all involved players.
+    Uses a group DM if multiple players are present,
+    individual DM if only the requester remains.
+    """
+    msg = (
+        f"Unfortunately your {label} LFG post expired before it could fill "
+        f"({voters}/{poll_threshold} additional players joined). "
+        f"Feel free to try again anytime!"
+    )
+
+    if len(all_players) > 1:
+        group_channel = create_group_dm(all_players)
+        if group_channel:
+            send_chat_message(group_channel, msg)
+            log.info(f"Expiry notification sent to group DM for: {all_players}")
+        else:
+            log.error(f"Failed to create group DM for expiry — players were: {all_players}")
+    else:
+        # Only the requester — use individual DM
+        try:
+            dm_channel = get_or_create_dm_channel(all_players[0])
+            if dm_channel:
+                send_chat_message(dm_channel, msg)
+                log.info(f"Expiry notification sent to {all_players[0]}")
+        except Exception as e:
+            log.error(f"Failed to notify {all_players[0]} of expiry: {e}")
 
 def handle_lfg_request(channel_id, requester_username, format_key):
     """Create an LFG topic and confirm via chat DM, or point to existing topic."""
@@ -413,7 +480,6 @@ def check_active_lfg_topics():
     for topic_id, info in list(active_lfg_topics.items()):
         requester = info["requester"]
         format_key = info["format_key"]
-        channel_id = info["channel_id"]
         created_at = info["created_at"]
         _, seat_count, poll_threshold, _, label = LFG_FORMATS[format_key]
 
@@ -425,36 +491,12 @@ def check_active_lfg_topics():
                 continue
 
             if voters >= poll_threshold:
-                # Poll fulfilled — create Convoke room and DM all voters plus requester
+                # Poll fulfilled — notify all players via group DM
                 voter_usernames = get_poll_voters(topic_id, post_id) if post_id else []
                 all_players = list(set(voter_usernames + [requester]))
                 log.info(f"Match found! Topic {topic_id} ({label}): {all_players}")
 
-                try:
-                    room_url = create_convoke_room(requester, format_key)
-                    if room_url:
-                        msg = (
-                            f"✅ **Game found!** Your {label} game is ready.\n\n"
-                            f"**Join here:** {room_url}\n\n"
-                            f"Good luck and have fun! No Discord required."
-                        )
-                        for username in all_players:
-                            try:
-                                dm_channel = get_or_create_dm_channel(username)
-                                if dm_channel:
-                                    send_chat_message(dm_channel, msg)
-                            except Exception as e:
-                                log.error(f"Failed to DM {username}: {e}")
-                        log.info(f"Convoke room created and DMs sent: {room_url}")
-                    else:
-                        log.error("Convoke returned no URL")
-                        if channel_id:
-                            send_chat_message(channel_id, "A match was found but the Convoke room couldn't be created. Please coordinate directly.")
-
-                except Exception as e:
-                    log.error(f"Convoke API error: {e}")
-                    if channel_id:
-                        send_chat_message(channel_id, "A match was found but the Convoke room couldn't be created. Please coordinate directly.")
+                notify_match(all_players, label)
 
                 try:
                     delete_topic(topic_id)
@@ -469,19 +511,9 @@ def check_active_lfg_topics():
                 log.info(f"LFG topic {topic_id} expired with {voters}/{poll_threshold} poll votes")
 
                 voter_usernames = get_poll_voters(topic_id, post_id) if post_id else []
-                notify_users = list(set(voter_usernames + [requester]))
+                all_players = list(set(voter_usernames + [requester]))
 
-                for username in notify_users:
-                    try:
-                        dm_channel = get_or_create_dm_channel(username)
-                        if dm_channel:
-                            send_chat_message(
-                                dm_channel,
-                                f"Unfortunately your {label} LFG post expired before it could fill "
-                                f"({voters}/{poll_threshold} additional players joined). Feel free to try again anytime!"
-                            )
-                    except Exception as e:
-                        log.error(f"Failed to notify {username}: {e}")
+                notify_expiry(all_players, label, voters, poll_threshold)
 
                 try:
                     delete_topic(topic_id)
@@ -502,8 +534,7 @@ def restore_active_topics():
     On startup, reload existing LFG topics into memory.
     Each restored topic receives a fresh 1-hour expiry window from
     restart time since the original creation time is not persisted.
-    channel_id is unknown after restart and set to None — Convoke
-    fallback error messages will be suppressed for restored topics.
+    channel_id is unknown after restart and set to None.
     """
     log.info("Restoring active LFG topics from forum...")
     for format_key, (category_id, _, _, _, label) in LFG_FORMATS.items():
@@ -529,7 +560,7 @@ def restore_active_topics():
 # ============================================================
 
 def main():
-    log.info("PDH Forum LFG Bot v2.1.0 starting...")
+    log.info("PDH Forum LFG Bot v2.2.0 starting...")
     restore_active_topics()
     log.info(f"Monitoring every {POLL_INTERVAL_SECONDS} seconds. Active topics: {len(active_lfg_topics)}")
 
