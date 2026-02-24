@@ -11,6 +11,9 @@ v2.2.1 (2026-02-24)
   - Fixed DM channel creation endpoint from /chat/api/direct-messages
     to /chat/api/direct-message-channels (confirmed via rails routes)
   - Applies to both create_group_dm() and get_or_create_dm_channel()
+  - Removed hardcoded API keys from source code
+  - DISCOURSE_API_KEY and CONVOKE_API_KEY now read from environment
+    variables via os.environ — loaded from /etc/lfg_bot.conf on server
 
 v2.2.0 (2026-02-24)
   - Replaced individual DM loop with single group DM channel
@@ -69,6 +72,7 @@ TRIGGERS (send via DM to @PDHMatchmaker)
   1v1    -> 1v1 PDH LFG (2 players, poll needs 1 vote)
 """
 
+import os
 import requests
 import time
 import logging
@@ -78,12 +82,12 @@ import logging
 # ============================================================
 
 DISCOURSE_URL = "https://pdhforum.com"
-DISCOURSE_API_KEY = "6421b230423d9fcfc043e4f1537441baa05e079f0a7442494c7ecc929360f3c3"
+DISCOURSE_API_KEY = os.environ["DISCOURSE_API_KEY"]
 DISCOURSE_BOT_USERNAME = "PDHMatchmaker"
 
 # Convoke API — stubbed out pending group DM confirmation
 # CONVOKE_API_URL = "https://api.convoke.games/api/game/create-game"
-# CONVOKE_API_KEY = "convk_6536e0adb4c407d49bfa7d4ee4d44c489dc147a6"
+# CONVOKE_API_KEY = os.environ["CONVOKE_API_KEY"]
 
 CONVOKE_LOBBY_URL = "https://convoke.games/en/lobby"
 
