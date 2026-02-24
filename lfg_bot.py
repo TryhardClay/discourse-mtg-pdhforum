@@ -284,9 +284,6 @@ def check_dm_channels():
         channels = get_dm_channels()
         for channel in channels:
             channel_id = channel.get("id")
-            tracking = channel.get("meta", {}).get("message_bus_last_ids", {})
-            unread = tracking.get("new_messages", 0)
-
             messages = get_channel_messages(channel_id)
 
             # First time seeing this channel — mark all existing messages as seen
@@ -296,9 +293,7 @@ def check_dm_channels():
                     processed_message_ids[channel_id] = max(m.get("id", 0) for m in messages)
                 else:
                     processed_message_ids[channel_id] = 0
-                continue
-
-            if unread == 0:
+                log.info(f"Initialized channel {channel_id}, last message id: {processed_message_ids[channel_id]}")
                 continue
 
             last_seen = processed_message_ids.get(channel_id, 0)
@@ -315,6 +310,8 @@ def check_dm_channels():
 
                 text = msg.get("message", "").strip().lower()
                 processed_message_ids[channel_id] = max(last_seen, msg_id)
+
+                log.info(f"New message in channel {channel_id} from {sender}: {text!r}")
 
                 if text in LFG_FORMATS:
                     handle_lfg_request(channel_id, sender, text)
