@@ -26,7 +26,8 @@ DISCOURSE_BOT_USERNAME = "PDHMatchmaker"
 CONVOKE_API_URL = "https://api.convoke.games/api/game/create-game"
 CONVOKE_API_KEY = "convk_6536e0adb4c407d49bfa7d4ee4d44c489dc147a6"
 
-POLL_INTERVAL_SECONDS = 30
+POLL_INTERVAL_SECONDS = 5
+LFG_EXPIRY_SECONDS = 3600  # 1 hour
 
 # LFG category config: trigger -> (category_id, seat_count, convoke_format, label)
 LFG_FORMATS = {
@@ -125,7 +126,7 @@ def create_lfg_topic(requester_username, format_key):
 **Format:** {label}
 **Platform:** Convoke (webcam)
 
-[poll type=regular results=always public=true close=1h]
+[poll type=regular results=always public=true chartType=bar]
 * Join me
 [/poll]"""
 
@@ -209,17 +210,36 @@ def create_convoke_room(requester_username, format_key):
 # channel_id -> last processed message id
 processed_message_ids = {}
 
-# topic_id -> {requester, format_key, channel_id}
+# topic_id -> {requester, format_key, channel_id, created_at}
 active_lfg_topics = {}
 
 # ============================================================
 # Core Logic
 # ============================================================
 
+def get_active_topic_for_format(format_key):
+    """Return the topic_id of an existing active topic for this format, or None."""
+    for topic_id, info in active_lfg_topics.items():
+        if info["format_key"] == format_key:
+            return topic_id
+    return None
+
 def handle_lfg_request(channel_id, requester_username, format_key):
-    """Create an LFG topic and confirm via chat DM."""
+    """Create an LFG topic and confirm via chat DM, or point to existing topic."""
     _, _, _, label = LFG_FORMATS[format_key]
     log.info(f"LFG request from {requester_username} for {label} (channel {channel_id})")
+
+    # Check if there's already an active topic for this format
+    existing_topic_id = get_active_topic_for_format(format_key)
+    if existing_topic_id:
+        topic_url = f"{DISCOURSE_URL}/t/{existing_topic_id}"
+        log.info(f"Active {label} topic already exists ({existing_topic_id}), pointing {requester_username} to it")
+        send_chat_message(
+            channel_id,
+            f"There's already a {label} game looking for players! Head over and join the poll:\n\n"
+            f"➡️ {topic_url}"
+        )
+        return
 
     try:
         result = create_lfg_topic(requester_username, format_key)
@@ -233,7 +253,8 @@ def handle_lfg_request(channel_id, requester_username, format_key):
         active_lfg_topics[topic_id] = {
             "requester": requester_username,
             "format_key": format_key,
-            "channel_id": channel_id
+            "channel_id": channel_id,
+            "created_at": time.time()
         }
 
         topic_url = f"{DISCOURSE_URL}/t/{topic_id}"
@@ -305,11 +326,13 @@ def check_dm_channels():
 def check_active_lfg_topics():
     """Check all active LFG topics for fulfilled or expired polls."""
     stale_topics = []
+    now = time.time()
 
     for topic_id, info in list(active_lfg_topics.items()):
         requester = info["requester"]
         format_key = info["format_key"]
         channel_id = info["channel_id"]
+        created_at = info["created_at"]
         _, seat_count, _, label = LFG_FORMATS[format_key]
 
         try:
@@ -320,7 +343,7 @@ def check_active_lfg_topics():
                 continue
 
             if voters >= seat_count:
-                # Poll fulfilled
+                # Poll fulfilled — create Convoke room and DM all voters
                 voter_usernames = get_poll_voters(topic_id, post_id) if post_id else []
                 log.info(f"Match found! Topic {topic_id} ({label}): {voter_usernames}")
 
@@ -332,7 +355,6 @@ def check_active_lfg_topics():
                             f"**Join here:** {room_url}\n\n"
                             f"Good luck and have fun! No Discord required."
                         )
-                        # DM all voters
                         for username in voter_usernames:
                             try:
                                 dm_channel = get_or_create_dm_channel(username)
@@ -357,8 +379,8 @@ def check_active_lfg_topics():
 
                 stale_topics.append(topic_id)
 
-            elif is_closed and voters < seat_count:
-                # Poll expired unfulfilled — notify all who did vote
+            elif now - created_at >= LFG_EXPIRY_SECONDS:
+                # Topic has been alive for 1 hour without filling — expire it
                 log.info(f"LFG topic {topic_id} expired with {voters}/{seat_count} players")
 
                 voter_usernames = get_poll_voters(topic_id, post_id) if post_id else []
@@ -404,7 +426,8 @@ def restore_active_topics():
                     active_lfg_topics[topic_id] = {
                         "requester": requester,
                         "format_key": format_key,
-                        "channel_id": None  # channel unknown after restart
+                        "channel_id": None,   # channel unknown after restart
+                        "created_at": time.time()  # fresh hour from restart
                     }
                     log.info(f"  Restored {label} topic {topic_id} for {requester}")
         except Exception as e:
