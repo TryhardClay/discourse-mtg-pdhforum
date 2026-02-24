@@ -7,6 +7,11 @@ Author: TryhardClay
 ===============================================================
 VERSION HISTORY
 ===============================================================
+v2.2.1 (2026-02-24)
+  - Fixed DM channel creation endpoint from /chat/api/direct-messages
+    to /chat/api/direct-message-channels (confirmed via rails routes)
+  - Applies to both create_group_dm() and get_or_create_dm_channel()
+
 v2.2.0 (2026-02-24)
   - Replaced individual DM loop with single group DM channel
     containing all matched players plus the bot account
@@ -168,7 +173,7 @@ def send_chat_message(channel_id, message):
 def get_or_create_dm_channel(username):
     """Get or create a 1:1 DM channel with a specific user."""
     data = {"target_usernames": [username]}
-    result = discourse_post("/chat/api/direct-messages", data)
+    result = discourse_post("/chat/api/direct-message-channels", data)
     return result.get("channel", {}).get("id")
 
 def create_group_dm(usernames):
@@ -180,7 +185,7 @@ def create_group_dm(usernames):
     """
     try:
         data = {"target_usernames": usernames}
-        result = discourse_post("/chat/api/direct-messages", data)
+        result = discourse_post("/chat/api/direct-message-channels", data)
         channel_id = result.get("channel", {}).get("id")
         if channel_id:
             log.info(f"Created group DM channel {channel_id} for: {usernames}")
@@ -560,7 +565,7 @@ def restore_active_topics():
 # ============================================================
 
 def main():
-    log.info("PDH Forum LFG Bot v2.2.0 starting...")
+    log.info("PDH Forum LFG Bot v2.2.1 starting...")
     restore_active_topics()
     log.info(f"Monitoring every {POLL_INTERVAL_SECONDS} seconds. Active topics: {len(active_lfg_topics)}")
 
