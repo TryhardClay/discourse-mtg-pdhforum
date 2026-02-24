@@ -1,17 +1,54 @@
 #!/usr/bin/env python3
 """
-PDH Forum LFG Bot v2
-Monitors chat DMs to @PDHMatchmaker for LFG triggers,
-creates Looking for Game topics in the appropriate category,
-monitors polls, and delivers Convoke game links via chat DM.
+PDH Forum LFG Bot
+Repository: https://github.com/TryhardClay/discourse-mtg-pdhforum
+Author: TryhardClay
 
-Triggers:
-  casual -> Casual PDH LFG (4 players)
-  comp   -> Competitive PDH LFG (4 players)
-  1v1    -> 1v1 PDH LFG (2 players)
+===============================================================
+VERSION HISTORY
+===============================================================
+v2.1.0 (2026-02-24)
+  - Redesigned check_dm_channels for scalability:
+      * Channels with unread_count == 0 are skipped entirely
+      * New channels use last_message.id from channel list
+        response to set last_seen baseline (no extra API call)
+      * New channels with unread_count > 0 on first sight are
+        processed immediately rather than skipped until next cycle
+  - Restored correct unread guard using tracking.channel_tracking
+    (was previously removed, causing excessive API calls)
+  - Fixed get_poll_voters: removed invalid option_id="0" parameter
+    (Discourse uses hashed option IDs, not sequential integers)
+  - Fixed get_poll_voters: voters dict guarded with `or {}` to
+    handle null response from Discourse on empty polls
+  - Added channel_id None guard in Convoke error fallback to
+    prevent crash on restored topics with unknown channel
 
-Poll threshold is seat_count - 1 because the requester fills one seat
-implicitly by initiating the request via DM.
+v2.0.0 (2026-02-24)
+  - Replaced traditional PM polling with Discourse chat API
+  - Three-format routing: casual / comp / 1v1
+  - Fixed chat send endpoint to POST /chat/{channel_id}
+  - Bot startup skips pre-existing messages to prevent stale
+    trigger responses on restart
+  - Poll syntax: results=always, chartType=bar, no close= timer
+  - Bot owns topic lifecycle via created_at timestamp tracking
+    (LFG_EXPIRY_SECONDS = 3600) instead of poll close timer
+  - poll_threshold split from seat_count: requester implicitly
+    fills one seat, so poll needs seat_count - 1 votes to trigger
+  - Simultaneous request handling: second requester for same
+    format is pointed to existing active topic instead of
+    creating a duplicate
+  - On bot restart, active topics are restored with a fresh
+    1-hour expiry window
+  - Cycle time reduced from 30s to 5s (max 3 active topics)
+  - All voters plus requester receive Convoke link and expiry
+    notifications via DM
+
+===============================================================
+TRIGGERS (send via DM to @PDHMatchmaker)
+===============================================================
+  casual -> Casual PDH LFG (4 players, poll needs 3 votes)
+  comp   -> Competitive PDH LFG (4 players, poll needs 3 votes)
+  1v1    -> 1v1 PDH LFG (2 players, poll needs 1 vote)
 """
 
 import requests
@@ -35,7 +72,7 @@ LFG_EXPIRY_SECONDS = 3600  # 1 hour
 # LFG category config:
 # trigger -> (category_id, seat_count, poll_threshold, convoke_format, label)
 #
-# seat_count     = total players for the Convoke room (unchanged)
+# seat_count     = total players for the Convoke room
 # poll_threshold = votes needed to trigger a match (seat_count - 1,
 #                  because the requester fills one seat implicitly)
 LFG_FORMATS = {
@@ -94,6 +131,8 @@ def get_dm_channel_data():
     Fetch all DM channels and tracking data for the bot account.
     Returns (channels list, channel_tracking dict).
     channel_tracking is keyed by string channel ID and contains unread_count.
+    This is a single API call that provides everything needed to decide
+    whether any given channel requires further attention.
     """
     data = discourse_get("/chat/api/me/channels")
     channels = data.get("direct_message_channels", [])
@@ -158,7 +197,7 @@ def get_lfg_topics(category_id):
     return data.get("topic_list", {}).get("topics", [])
 
 def get_poll_data(topic_id):
-    """Fetch poll voters and status from a topic."""
+    """Fetch poll voter count and status from a topic."""
     data = discourse_get(f"/t/{topic_id}.json")
     posts = data.get("post_stream", {}).get("posts", [])
     if not posts:
@@ -176,10 +215,9 @@ def get_poll_data(topic_id):
 def get_poll_voters(topic_id, post_id):
     """
     Get usernames of all poll voters.
-    Note: option_id is intentionally omitted — Discourse uses hashed option IDs,
+    option_id is intentionally omitted — Discourse uses hashed option IDs,
     not sequential integers. Omitting it returns all voters across all options.
-    The voters value is explicitly guarded against None since Discourse may return
-    null for an empty voters dict.
+    voters is guarded with `or {}` since Discourse may return null for empty polls.
     """
     try:
         data = discourse_get(
@@ -227,6 +265,8 @@ def create_convoke_room(requester_username, format_key):
 # ============================================================
 
 # channel_id -> last processed message id
+# Only populated for channels that have had unread activity.
+# Channels with no unread messages are never fetched.
 processed_message_ids = {}
 
 # topic_id -> {requester, format_key, channel_id, created_at}
@@ -291,36 +331,47 @@ def handle_lfg_request(channel_id, requester_username, format_key):
 
 def check_dm_channels():
     """
-    Check all DM channels for new LFG trigger messages.
-    Uses the top-level tracking.channel_tracking unread_count as a gate
-    to avoid fetching messages from channels with no new activity.
-    This reduces API call volume significantly during idle periods.
+    Check DM channels for new LFG trigger messages.
+
+    Scalability design:
+    - One API call per cycle fetches all channel data including unread counts.
+    - Channels with unread_count == 0 are skipped with no further API calls.
+    - New channels (never seen before) use last_message.id from the channel
+      list response to set their last_seen baseline — no extra fetch needed.
+    - New channels that already have unread_count > 0 on first sight are
+      processed immediately rather than skipped until next cycle.
+    - Result: idle state costs one API call per cycle regardless of user count.
+      Active state costs one additional API call per channel with unread messages.
     """
     try:
         channels, channel_tracking = get_dm_channel_data()
 
         for channel in channels:
             channel_id = channel.get("id")
-
-            # First time seeing this channel — fetch messages to establish
-            # the last seen ID baseline, then skip until next cycle.
-            # This prevents the bot from processing messages that existed
-            # before it started.
-            if channel_id not in processed_message_ids:
-                messages = get_channel_messages(channel_id)
-                if messages:
-                    processed_message_ids[channel_id] = max(m.get("id", 0) for m in messages)
-                else:
-                    processed_message_ids[channel_id] = 0
-                log.info(f"Initialized channel {channel_id}, last message id: {processed_message_ids[channel_id]}")
-                continue
-
-            # Use the correct unread count from tracking.channel_tracking,
-            # keyed by string channel ID. Skip fetch if nothing new.
             unread = channel_tracking.get(str(channel_id), {}).get("unread_count", 0)
-            if unread == 0:
+
+            if channel_id not in processed_message_ids:
+                # New channel — set last_seen from last_message.id in channel list.
+                # No extra API call needed.
+                last_msg_id = channel.get("last_message", {}).get("id", 0)
+
+                if unread == 0:
+                    # No unread messages — just record the baseline and move on.
+                    processed_message_ids[channel_id] = last_msg_id
+                    log.info(f"Initialized channel {channel_id}, last message id: {last_msg_id}")
+                    continue
+                else:
+                    # Unread messages on first sight — set baseline to one before
+                    # the last message so we process the unread messages now.
+                    # We fetch the full message list to get all unread content.
+                    processed_message_ids[channel_id] = last_msg_id - unread
+                    log.info(f"Initialized channel {channel_id} with {unread} unread messages")
+
+            elif unread == 0:
+                # Known channel, nothing new — skip entirely.
                 continue
 
+            # Fetch and process new messages for this channel.
             messages = get_channel_messages(channel_id)
             last_seen = processed_message_ids.get(channel_id, 0)
 
@@ -447,7 +498,13 @@ def check_active_lfg_topics():
         active_lfg_topics.pop(topic_id, None)
 
 def restore_active_topics():
-    """On startup, reload existing LFG topics into memory."""
+    """
+    On startup, reload existing LFG topics into memory.
+    Each restored topic receives a fresh 1-hour expiry window from
+    restart time since the original creation time is not persisted.
+    channel_id is unknown after restart and set to None — Convoke
+    fallback error messages will be suppressed for restored topics.
+    """
     log.info("Restoring active LFG topics from forum...")
     for format_key, (category_id, _, _, _, label) in LFG_FORMATS.items():
         try:
@@ -460,8 +517,8 @@ def restore_active_topics():
                     active_lfg_topics[topic_id] = {
                         "requester": requester,
                         "format_key": format_key,
-                        "channel_id": None,        # channel unknown after restart
-                        "created_at": time.time()  # fresh hour from restart
+                        "channel_id": None,
+                        "created_at": time.time()
                     }
                     log.info(f"  Restored {label} topic {topic_id} for {requester}")
         except Exception as e:
@@ -472,7 +529,7 @@ def restore_active_topics():
 # ============================================================
 
 def main():
-    log.info("PDH Forum LFG Bot v2 starting...")
+    log.info("PDH Forum LFG Bot v2.1.0 starting...")
     restore_active_topics()
     log.info(f"Monitoring every {POLL_INTERVAL_SECONDS} seconds. Active topics: {len(active_lfg_topics)}")
 
