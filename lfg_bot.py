@@ -89,10 +89,16 @@ def discourse_delete(path):
 # Chat API Helpers
 # ============================================================
 
-def get_dm_channels():
-    """Fetch all DM channels for the bot account."""
+def get_dm_channel_data():
+    """
+    Fetch all DM channels and tracking data for the bot account.
+    Returns (channels list, channel_tracking dict).
+    channel_tracking is keyed by string channel ID and contains unread_count.
+    """
     data = discourse_get("/chat/api/me/channels")
-    return data.get("direct_message_channels", [])
+    channels = data.get("direct_message_channels", [])
+    channel_tracking = data.get("tracking", {}).get("channel_tracking", {})
+    return channels, channel_tracking
 
 def get_channel_messages(channel_id):
     """Fetch messages from a chat DM channel."""
@@ -168,7 +174,13 @@ def get_poll_data(topic_id):
     return voters, is_closed, post_id, data
 
 def get_poll_voters(topic_id, post_id):
-    """Get usernames of all poll voters."""
+    """
+    Get usernames of all poll voters.
+    Note: option_id is intentionally omitted — Discourse uses hashed option IDs,
+    not sequential integers. Omitting it returns all voters across all options.
+    The voters value is explicitly guarded against None since Discourse may return
+    null for an empty voters dict.
+    """
     try:
         data = discourse_get(
             "/polls/voters.json",
@@ -176,10 +188,9 @@ def get_poll_voters(topic_id, post_id):
                 "topic_id": topic_id,
                 "post_id": post_id,
                 "poll_name": "poll",
-                "option_id": "0"
             }
         )
-        voters = data.get("voters", {})
+        voters = data.get("voters") or {}
         all_voters = []
         for option_voters in voters.values():
             all_voters.extend([v.get("username") for v in option_voters if v.get("username")])
@@ -279,16 +290,24 @@ def handle_lfg_request(channel_id, requester_username, format_key):
         send_chat_message(channel_id, "Sorry, something went wrong. Please try again.")
 
 def check_dm_channels():
-    """Check all DM channels for new LFG trigger messages."""
+    """
+    Check all DM channels for new LFG trigger messages.
+    Uses the top-level tracking.channel_tracking unread_count as a gate
+    to avoid fetching messages from channels with no new activity.
+    This reduces API call volume significantly during idle periods.
+    """
     try:
-        channels = get_dm_channels()
+        channels, channel_tracking = get_dm_channel_data()
+
         for channel in channels:
             channel_id = channel.get("id")
-            messages = get_channel_messages(channel_id)
 
-            # First time seeing this channel — mark all existing messages as seen
-            # so we only respond to messages sent after the bot started
+            # First time seeing this channel — fetch messages to establish
+            # the last seen ID baseline, then skip until next cycle.
+            # This prevents the bot from processing messages that existed
+            # before it started.
             if channel_id not in processed_message_ids:
+                messages = get_channel_messages(channel_id)
                 if messages:
                     processed_message_ids[channel_id] = max(m.get("id", 0) for m in messages)
                 else:
@@ -296,6 +315,13 @@ def check_dm_channels():
                 log.info(f"Initialized channel {channel_id}, last message id: {processed_message_ids[channel_id]}")
                 continue
 
+            # Use the correct unread count from tracking.channel_tracking,
+            # keyed by string channel ID. Skip fetch if nothing new.
+            unread = channel_tracking.get(str(channel_id), {}).get("unread_count", 0)
+            if unread == 0:
+                continue
+
+            messages = get_channel_messages(channel_id)
             last_seen = processed_message_ids.get(channel_id, 0)
 
             for msg in messages:
@@ -371,11 +397,13 @@ def check_active_lfg_topics():
                         log.info(f"Convoke room created and DMs sent: {room_url}")
                     else:
                         log.error("Convoke returned no URL")
-                        send_chat_message(channel_id, "A match was found but the Convoke room couldn't be created. Please coordinate directly.")
+                        if channel_id:
+                            send_chat_message(channel_id, "A match was found but the Convoke room couldn't be created. Please coordinate directly.")
 
                 except Exception as e:
                     log.error(f"Convoke API error: {e}")
-                    send_chat_message(channel_id, "A match was found but the Convoke room couldn't be created. Please coordinate directly.")
+                    if channel_id:
+                        send_chat_message(channel_id, "A match was found but the Convoke room couldn't be created. Please coordinate directly.")
 
                 try:
                     delete_topic(topic_id)
