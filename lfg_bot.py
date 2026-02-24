@@ -7,6 +7,16 @@ Author: TryhardClay
 ===============================================================
 VERSION HISTORY
 ===============================================================
+v2.2.2 (2026-02-24)
+  - Capped matched players at seat_count to prevent over-full games
+    when multiple voters arrive before the bot's next cycle
+  - Voter list sliced to poll_threshold (first-come-first-served by
+    Discourse vote order); requester always included
+  - Overflow voters receive a courtesy DM notifying them the game
+    filled and inviting them to try again
+  - Updated match notification message to prompt players to elect
+    one person to set up the Convoke lobby
+
 v2.2.1 (2026-02-24)
   - Fixed DM channel creation endpoint from /chat/api/direct-messages
     to /chat/api/direct-message-channels (confirmed via rails routes)
@@ -317,9 +327,9 @@ def notify_match(all_players, label):
     """
     msg = (
         f"✅ **Game found!** Your {label} game is ready.\n\n"
-        f"Head to the Convoke lobby to set up your game:\n"
+        f"Elect one person from this group to head over to the Convoke lobby "
+        f"and set up your game:\n"
         f"**{CONVOKE_LOBBY_URL}**\n\n"
-        f"Your fellow players: {', '.join(f'@{u}' for u in all_players)}\n\n"
         f"Good luck and have fun! No Discord required."
     )
 
@@ -500,12 +510,35 @@ def check_active_lfg_topics():
                 continue
 
             if voters >= poll_threshold:
-                # Poll fulfilled — notify all players via group DM
+                # Poll fulfilled — cap players at seat_count, notify overflow
                 voter_usernames = get_poll_voters(topic_id, post_id) if post_id else []
-                all_players = list(set(voter_usernames + [requester]))
+
+                # Slice to poll_threshold voters (first-come-first-served by vote order).
+                # Requester always included regardless of whether they appear in voters.
+                capped_voters = voter_usernames[:poll_threshold]
+                all_players = list(dict.fromkeys([requester] + capped_voters))  # preserve order, no duplicates
+                overflow = [u for u in voter_usernames[poll_threshold:] if u not in all_players]
+
                 log.info(f"Match found! Topic {topic_id} ({label}): {all_players}")
+                if overflow:
+                    log.info(f"Overflow voters for topic {topic_id}: {overflow}")
 
                 notify_match(all_players, label)
+
+                # Notify overflow voters that the game filled without them
+                for username in overflow:
+                    try:
+                        dm_channel = get_or_create_dm_channel(username)
+                        if dm_channel:
+                            send_chat_message(
+                                dm_channel,
+                                f"Sorry, the {label} game you voted on just filled up a moment before "
+                                f"we could grab your spot! Feel free to send me **{format_key}** to start "
+                                f"a new search anytime."
+                            )
+                            log.info(f"Overflow courtesy DM sent to {username}")
+                    except Exception as e:
+                        log.error(f"Failed to send overflow DM to {username}: {e}")
 
                 try:
                     delete_topic(topic_id)
@@ -569,7 +602,7 @@ def restore_active_topics():
 # ============================================================
 
 def main():
-    log.info("PDH Forum LFG Bot v2.2.1 starting...")
+    log.info("PDH Forum LFG Bot v2.2.2 starting...")
     restore_active_topics()
     log.info(f"Monitoring every {POLL_INTERVAL_SECONDS} seconds. Active topics: {len(active_lfg_topics)}")
 
