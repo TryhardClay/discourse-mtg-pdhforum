@@ -7,6 +7,16 @@ Author: TryhardClay
 ===============================================================
 VERSION HISTORY
 ===============================================================
+v2.3.0 (2026-02-25)
+  - Convoke API room creation fully implemented and confirmed working
+  - create_convoke_room() added: calls POST /api/game/create-game with
+    apiKey, name, isPublic, seatLimit, and format from LFG_FORMATS
+  - notify_match() updated to accept seat_count and convoke_format args
+  - Successful room creation sends unique join URL directly in group DM
+  - Lobby fallback (convoke.games/en/lobby) retained on API failure
+  - CONVOKE_API_URL and CONVOKE_API_KEY un-stubbed and active
+  - End-to-end pipeline confirmed: trigger → poll → match → Convoke → DM
+
 v2.2.2 (2026-02-24)
   - Capped matched players at seat_count to prevent over-full games
     when multiple voters arrive before the bot's next cycle
@@ -95,10 +105,8 @@ DISCOURSE_URL = "https://pdhforum.com"
 DISCOURSE_API_KEY = os.environ["DISCOURSE_API_KEY"]
 DISCOURSE_BOT_USERNAME = "PDHMatchmaker"
 
-# Convoke API — stubbed out pending group DM confirmation
-# CONVOKE_API_URL = "https://api.convoke.games/api/game/create-game"
-# CONVOKE_API_KEY = os.environ["CONVOKE_API_KEY"]
-
+CONVOKE_API_URL = "https://api.convoke.games/api/game/create-game"
+CONVOKE_API_KEY = os.environ["CONVOKE_API_KEY"]
 CONVOKE_LOBBY_URL = "https://convoke.games/en/lobby"
 
 POLL_INTERVAL_SECONDS = 5
@@ -211,6 +219,37 @@ def create_group_dm(usernames):
         return None
 
 # ============================================================
+# Convoke API Helper
+# ============================================================
+
+def create_convoke_room(label, seat_count, convoke_format):
+    """
+    Call the Convoke API to create a game room.
+    Returns the join URL on success, None on failure.
+    """
+    try:
+        payload = {
+            "apiKey": CONVOKE_API_KEY,
+            "name": f"PDH Forum — {label}",
+            "isPublic": False,
+            "seatLimit": seat_count,
+            "format": convoke_format
+        }
+        resp = requests.post(CONVOKE_API_URL, json=payload, timeout=10)
+        resp.raise_for_status()
+        data = resp.json()
+        url = data.get("url")
+        if url:
+            log.info(f"Convoke room created: {url}")
+            return url
+        else:
+            log.error(f"Convoke response missing url field: {data}")
+            return None
+    except Exception as e:
+        log.error(f"Convoke API error: {e}")
+        return None
+
+# ============================================================
 # Topic Helpers
 # ============================================================
 
@@ -319,19 +358,26 @@ def get_active_topic_for_format(format_key):
             return topic_id
     return None
 
-def notify_match(all_players, label):
+def notify_match(all_players, label, seat_count, convoke_format):
     """
     Send a match notification to all players via a single group DM.
-    Creates a group DM channel containing all players.
-    Convoke API room creation is stubbed — lobby link used as baseline.
+    Attempts Convoke room creation — falls back to lobby link on failure.
     """
-    msg = (
-        f"✅ **Game found!** Your {label} game is ready.\n\n"
-        f"Elect one person from this group to head over to the Convoke lobby "
-        f"and set up your game:\n"
-        f"**{CONVOKE_LOBBY_URL}**\n\n"
-        f"Good luck and have fun! No Discord required."
-    )
+    room_url = create_convoke_room(label, seat_count, convoke_format)
+    if room_url:
+        msg = (
+            f"✅ **Game found!** Your {label} game is ready.\n\n"
+            f"Join your Convoke room here:\n"
+            f"**{room_url}**\n\n"
+            f"Good luck and have fun! No Discord required."
+        )
+    else:
+        msg = (
+            f"✅ **Game found!** Your {label} game is ready.\n\n"
+            f"Convoke room creation failed — elect one person to set up manually:\n"
+            f"**{CONVOKE_LOBBY_URL}**\n\n"
+            f"Good luck and have fun! No Discord required."
+        )
 
     group_channel = create_group_dm(all_players)
     if group_channel:
@@ -360,7 +406,6 @@ def notify_expiry(all_players, label, voters, poll_threshold):
         else:
             log.error(f"Failed to create group DM for expiry — players were: {all_players}")
     else:
-        # Only the requester — use individual DM
         try:
             dm_channel = get_or_create_dm_channel(all_players[0])
             if dm_channel:
@@ -374,7 +419,6 @@ def handle_lfg_request(channel_id, requester_username, format_key):
     _, _, _, _, label = LFG_FORMATS[format_key]
     log.info(f"LFG request from {requester_username} for {label} (channel {channel_id})")
 
-    # Check if there's already an active topic for this format
     existing_topic_id = get_active_topic_for_format(format_key)
     if existing_topic_id:
         topic_url = f"{DISCOURSE_URL}/t/{existing_topic_id}"
@@ -437,27 +481,19 @@ def check_dm_channels():
             unread = channel_tracking.get(str(channel_id), {}).get("unread_count", 0)
 
             if channel_id not in processed_message_ids:
-                # New channel — set last_seen from last_message.id in channel list.
-                # No extra API call needed.
                 last_msg_id = channel.get("last_message", {}).get("id", 0)
 
                 if unread == 0:
-                    # No unread messages — just record the baseline and move on.
                     processed_message_ids[channel_id] = last_msg_id
                     log.info(f"Initialized channel {channel_id}, last message id: {last_msg_id}")
                     continue
                 else:
-                    # Unread messages on first sight — set baseline to one before
-                    # the last message so we process the unread messages now.
-                    # We fetch the full message list to get all unread content.
                     processed_message_ids[channel_id] = last_msg_id - unread
                     log.info(f"Initialized channel {channel_id} with {unread} unread messages")
 
             elif unread == 0:
-                # Known channel, nothing new — skip entirely.
                 continue
 
-            # Fetch and process new messages for this channel.
             messages = get_channel_messages(channel_id)
             last_seen = processed_message_ids.get(channel_id, 0)
 
@@ -500,7 +536,7 @@ def check_active_lfg_topics():
         requester = info["requester"]
         format_key = info["format_key"]
         created_at = info["created_at"]
-        _, seat_count, poll_threshold, _, label = LFG_FORMATS[format_key]
+        _, seat_count, poll_threshold, convoke_format, label = LFG_FORMATS[format_key]
 
         try:
             voters, is_closed, post_id, topic_data = get_poll_data(topic_id)
@@ -510,22 +546,17 @@ def check_active_lfg_topics():
                 continue
 
             if voters >= poll_threshold:
-                # Poll fulfilled — cap players at seat_count, notify overflow
                 voter_usernames = get_poll_voters(topic_id, post_id) if post_id else []
-
-                # Slice to poll_threshold voters (first-come-first-served by vote order).
-                # Requester always included regardless of whether they appear in voters.
                 capped_voters = voter_usernames[:poll_threshold]
-                all_players = list(dict.fromkeys([requester] + capped_voters))  # preserve order, no duplicates
+                all_players = list(dict.fromkeys([requester] + capped_voters))
                 overflow = [u for u in voter_usernames[poll_threshold:] if u not in all_players]
 
                 log.info(f"Match found! Topic {topic_id} ({label}): {all_players}")
                 if overflow:
                     log.info(f"Overflow voters for topic {topic_id}: {overflow}")
 
-                notify_match(all_players, label)
+                notify_match(all_players, label, seat_count, convoke_format)
 
-                # Notify overflow voters that the game filled without them
                 for username in overflow:
                     try:
                         dm_channel = get_or_create_dm_channel(username)
@@ -549,7 +580,6 @@ def check_active_lfg_topics():
                 stale_topics.append(topic_id)
 
             elif now - created_at >= LFG_EXPIRY_SECONDS:
-                # Topic has been alive for 1 hour without filling — expire it
                 log.info(f"LFG topic {topic_id} expired with {voters}/{poll_threshold} poll votes")
 
                 voter_usernames = get_poll_voters(topic_id, post_id) if post_id else []
@@ -602,7 +632,7 @@ def restore_active_topics():
 # ============================================================
 
 def main():
-    log.info("PDH Forum LFG Bot v2.2.2 starting...")
+    log.info("PDH Forum LFG Bot v2.3.0 starting...")
     restore_active_topics()
     log.info(f"Monitoring every {POLL_INTERVAL_SECONDS} seconds. Active topics: {len(active_lfg_topics)}")
 
